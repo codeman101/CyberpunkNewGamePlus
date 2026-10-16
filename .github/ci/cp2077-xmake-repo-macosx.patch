@@ -1,0 +1,657 @@
+diff --git a/packages/a/archive-xl/patches/macos-support-header.patch b/packages/a/archive-xl/patches/macos-support-header.patch
+new file mode 100644
+index 0000000..911e6f6
+--- /dev/null
++++ b/packages/a/archive-xl/patches/macos-support-header.patch
+@@ -0,0 +1,79 @@
++diff --git a/support/red4ext/ArchiveXL.hpp b/support/red4ext/ArchiveXL.hpp
++index b3eec91..e45c76e 100644
++--- a/support/red4ext/ArchiveXL.hpp
+++++ b/support/red4ext/ArchiveXL.hpp
++@@ -3,8 +3,12 @@
++ #include <filesystem>
++ #include <vector>
++ 
+++#if defined(_WIN32)
++ #include <libloaderapi.h>
++ #include <minwindef.h>
+++#else
+++#include <dlfcn.h>
+++#endif
++ 
++ #include <RED4ext/Callback.hpp>
++ #include <RED4ext/Memory/Allocators.hpp>
++@@ -60,13 +64,38 @@ public:
++ private:
++     ArchiveXL() = default;
++ 
+++#if !defined(_WIN32)
+++    // Same test as the Windows branch above: the PoolEngine pool is in the vault's pool registry. Vault::Get() cannot
+++    // be used here, so the vault is taken from the game's PoolStorageProxy<PoolEngine>::GetAllocator(). That storage
+++    // is set up when the game image loads and its allocator is the DefaultAllocator, the first member of the vault.
+++    // The getter only reads that static and allocates nothing, so it is safe at any time.
+++    inline static bool IsPoolEngineRegistered()
+++    {
+++        using GetVault_t = RED4ext::Memory::Vault* (*)();
+++
+++        static const auto getVault = reinterpret_cast<GetVault_t>(
+++            dlsym(RTLD_MAIN_ONLY, "_ZN3red6memory16PoolStorageProxyINS_10PoolEngineEE12GetAllocatorEv"));
+++
+++        if (!getVault)
+++            return false;
+++
+++        auto vault = getVault();
+++        return vault && vault->poolRegistry.Get(RED4ext::Memory::PoolEngine::Name);
+++    }
+++
+++#endif
++     inline static bool Initialize()
++     {
++         if (s_facade)
++             return true;
++ 
+++#if defined(_WIN32)
++         if (!RED4ext::Memory::Vault::Get()->poolRegistry.Get(RED4ext::Memory::PoolEngine::Name))
++             return false;
+++#else
+++        if (!IsPoolEngineRegistered())
+++            return false;
+++#endif
++ 
++         auto facade = RED4ext::CRTTISystem::Get()->GetClass("ArchiveXL");
++ 
++@@ -131,10 +160,22 @@ private:
++ 
++     inline static std::filesystem::path GetModulePath(HMODULE aHandle)
++     {
+++#if defined(_WIN32)
++         wchar_t path[MAX_PATH]{0};
++         auto length = GetModuleFileNameW(aHandle, path, MAX_PATH);
++ 
++         return std::filesystem::path(path).parent_path();
+++#else
+++        // The plugin that includes this header: find the image that holds this function.
+++        (void)aHandle;
+++        Dl_info info{};
+++        if (dladdr(reinterpret_cast<const void*>(&GetModulePath), &info) && info.dli_fname)
+++        {
+++            return std::filesystem::path(info.dli_fname).parent_path();
+++        }
+++
+++        return {};
+++#endif
++     }
++ 
++     inline static RED4ext::CClass* s_facade;
+diff --git a/packages/a/archive-xl/xmake.lua b/packages/a/archive-xl/xmake.lua
+index 46224ac..a8f6b94 100644
+--- a/packages/a/archive-xl/xmake.lua
++++ b/packages/a/archive-xl/xmake.lua
+@@ -7,15 +7,29 @@ package("archive-xl")
+     -- This packages support/red4ext/ only. It does not build the ArchiveXL mod itself --
+     -- users still need ArchiveXL installed in their game for the registration calls to do anything.
+     add_urls("https://github.com/psiberx/cp2077-archive-xl/archive/refs/tags/$(version).tar.gz",
+-             "https://github.com/psiberx/cp2077-archive-xl.git")
++             "https://github.com/psiberx/cp2077-archive-xl.git",
++             {version = function (version) return (tostring(version):gsub("%-macos%.%d+$", "")) end})
+ 
+-    add_versions("v1.27.1", "09b38c7a2f85eba869cd7f7b964de438a6d9cf25c650b3b9bdc4d08c8909645a")
+-    add_versions("v1.27.0", "3f97604e54be7f96b060f99e86e9db9b6297a0dd9a13270b715c6a701b656ada")
+-    add_versions("v1.26.8", "b1492e8215bc6b55e8ed28fc16fa8a87a7328faf3525102d8e02df99125199a6")
++    if is_plat("macosx") then
++        -- Same source as v1.27.1 with the macosx patch. The suffix keeps the patched package apart from cached
++        -- unpatched ones, and it is the only version offered here so dependents resolve to it.
++        add_versions("v1.27.1-macos.2", "09b38c7a2f85eba869cd7f7b964de438a6d9cf25c650b3b9bdc4d08c8909645a")
++    else
++        add_versions("v1.27.1", "09b38c7a2f85eba869cd7f7b964de438a6d9cf25c650b3b9bdc4d08c8909645a")
++        add_versions("v1.27.0", "3f97604e54be7f96b060f99e86e9db9b6297a0dd9a13270b715c6a701b656ada")
++        add_versions("v1.26.8", "b1492e8215bc6b55e8ed28fc16fa8a87a7328faf3525102d8e02df99125199a6")
++    end
+ 
+     add_deps("red4ext-sdk")
+ 
+-    on_install("windows|x64", function (package)
++    -- The macosx build needs three #if blocks in the header (no <libloaderapi.h>, no Vault pool test, dladdr for
++    -- the module path). Pending in psiberx/cp2077-archive-xl; drop this once the pinned tag has them.
++    if is_plat("macosx") then
++        add_patches("v1.27.1-macos.2", path.join(os.scriptdir(), "patches", "macos-support-header.patch"),
++                    "15ceca1d43a2be8454bc6dcedd04cdd484103c7c331c45259ba6cc6f8cd02ef4")
++    end
++
++    on_install("windows|x64", "macosx|arm64", function (package)
+         -- The header as shipped is not self-contained: it starts with <libloaderapi.h> /
+         -- <minwindef.h> (which need <Windows.h> first for _AMD64_, else winnt.h errors with
+         -- "No Target Architecture") and then pulls <RED4ext/RTTISystem.hpp>, which on its own
+@@ -23,10 +37,17 @@ package("archive-xl")
+         -- gets away with it because every consumer includes the SDK umbrella header from a
+         -- pch first. Hoisting that umbrella here fixes both, and costs nothing: RTTISystem.hpp
+         -- already drags in most of the SDK anyway.
+-        io.replace("support/red4ext/ArchiveXL.hpp",
+-                   "#include <libloaderapi.h>",
+-                   "#include <RED4ext/RED4ext.hpp>\n\n#include <libloaderapi.h>",
+-                   {plain = true})
++        if package:is_plat("windows") then
++            io.replace("support/red4ext/ArchiveXL.hpp",
++                       "#include <libloaderapi.h>",
++                       "#include <RED4ext/RED4ext.hpp>\n\n#include <libloaderapi.h>",
++                       {plain = true})
++        else
++            io.replace("support/red4ext/ArchiveXL.hpp",
++                       "#include <filesystem>",
++                       "#include <RED4ext/RED4ext.hpp>\n\n#include <filesystem>",
++                       {plain = true})
++        end
+ 
+         os.cp("support/red4ext/ArchiveXL.hpp", package:installdir("include/RED4ext"))
+     end)
+diff --git a/packages/r/red-lib/patches/macos-clang.patch b/packages/r/red-lib/patches/macos-clang.patch
+new file mode 100644
+index 0000000..93fa596
+--- /dev/null
++++ b/packages/r/red-lib/patches/macos-clang.patch
+@@ -0,0 +1,201 @@
++diff --git a/include/Red/TypeInfo/Definition.hpp b/include/Red/TypeInfo/Definition.hpp
++index 50dbb39..4c3f301 100644
++--- a/include/Red/TypeInfo/Definition.hpp
+++++ b/include/Red/TypeInfo/Definition.hpp
++@@ -667,7 +667,12 @@ public:
++ template<typename TClass>
++ class ClassDescriptorDefaultImpl : public ClassDescriptor<TClass>
++ {
+++#if defined(__APPLE__)
+++    // The macOS SDK declares the base as returning bool; clang rejects a const-qualified override of it.
+++    bool IsEqual(const void* aLhs, const void* aRhs, uint32_t a3) final // 48
+++#else
++     const bool IsEqual(const void* aLhs, const void* aRhs, uint32_t a3) final // 48
+++#endif
++     {
++         if constexpr (Detail::IsConstructionForwarded<TClass>)
++         {
++@@ -1000,7 +1005,8 @@ struct SystemBuilder
++ 
++         gameInstance->systemMap.Insert(systemType, systemInstance);
++         gameInstance->systemImplementations.Insert(systemType, systemType);
++-        gameInstance->systemInstances.EmplaceBack(systemInstance);
+++        // Clang finds Handle<Derived> -> Handle<IScriptable> ambiguous, so the conversion is spelled out.
+++        gameInstance->systemInstances.EmplaceBack(static_cast<Handle<IScriptable>&>(systemInstance));
++     }
++ 
++     static inline Handle<TSystem> BuildSystem()
++diff --git a/include/Red/TypeInfo/Macros/Definition.hpp b/include/Red/TypeInfo/Macros/Definition.hpp
++index bc3ba9b..93e5587 100644
++--- a/include/Red/TypeInfo/Macros/Definition.hpp
+++++ b/include/Red/TypeInfo/Macros/Definition.hpp
++@@ -4,6 +4,19 @@
++ #define X_RTTI_STR2(x) X_RTTI_STR1(x)
++ #define X_RTTI_LOCATION __FILE__ ":" X_RTTI_STR2(__LINE__)
++ 
+++// The registrar of a definition is an `inline static` member of a class template specialization
+++// (Red::ClassDefinition<T>::s_registrar). MSVC instantiates it eagerly. Clang and GCC instantiate it only when it is
+++// odr-used, so without this every RTTI_DEFINE_* of the plugin silently never registers. Taking the address in a
+++// variable the linker must keep (`used`) odr-uses it. Empty on MSVC.
+++#if defined(__clang__) || defined(__GNUC__)
+++#define X_RTTI_CAT2(a, b) a##b
+++#define X_RTTI_CAT(a, b) X_RTTI_CAT2(a, b)
+++#define X_RTTI_FORCE_REGISTRAR(...) \
+++    [[maybe_unused]] __attribute__((used)) static const void* const X_RTTI_CAT(x_rtti_force_, __COUNTER__) = &__VA_ARGS__::s_registrar;
+++#else
+++#define X_RTTI_FORCE_REGISTRAR(...)
+++#endif
+++
++ #define X_RTTI_TYPENAME(...) ::nameof::nameof_short_type<__VA_ARGS__>()
++ 
++ #define X_RTTI_NAME_SV(...) []() constexpr noexcept { \
++@@ -71,7 +84,8 @@ public: \
++             using T = Type; \
++             _desc; \
++         } \
++-    };
+++    }; \
+++    X_RTTI_FORCE_REGISTRAR(Red::ClassDefinition<_class>)
++ 
++ #define RTTI_EXPAND_CLASS(...) X_RTTI_OVERLOAD(X_RTTI_EXPAND_CLASS, __VA_ARGS__)
++ #define X_RTTI_EXPAND_CLASS_2(_class, _desc) \
++@@ -85,7 +99,8 @@ public: \
++             using T = Type; \
++             _desc; \
++         } \
++-    };
+++    }; \
+++    X_RTTI_FORCE_REGISTRAR(Red::ClassExpansion<_class, X_RTTI_LOCATION>)
++ #define X_RTTI_EXPAND_CLASS_3(_class, _expansion, _desc) \
++     template<> \
++     struct Red::TypeInfoBuilder<Red::ClassExpansion<_class, Red::Scope::For<_expansion>()>{}> \
++@@ -97,7 +112,8 @@ public: \
++             using T = Type; \
++             _desc; \
++         } \
++-    };
+++    }; \
+++    X_RTTI_FORCE_REGISTRAR(Red::ClassExpansion<_class, Red::Scope::For<_expansion>()>)
++ 
++ #define RTTI_ABSTRACT() type->MarkAbstract()
++ #define RTTI_SCRIPTED() type->MarkScripted()
++@@ -173,7 +189,8 @@ public: \
++         { \
++             return _name; \
++         } \
++-    };
+++    }; \
+++    X_RTTI_FORCE_REGISTRAR(Red::EnumDefinition<_enum>)
++ 
++ #define RTTI_DEFINE_FLAGS(...) X_RTTI_OVERLOAD(X_RTTI_DEFINE_FLAGS, __VA_ARGS__)
++ #define X_RTTI_DEFINE_FLAGS_1(_enum) X_RTTI_DEFINE_FLAGS_2(_enum, X_RTTI_TYPENAME(_enum))
++@@ -187,7 +204,8 @@ public: \
++         { \
++             return _name; \
++         } \
++-    };
+++    }; \
+++    X_RTTI_FORCE_REGISTRAR(Red::FlagsDefinition<_enum>)
++ 
++ #define RTTI_EXPAND_ENUM(...) X_RTTI_OVERLOAD(X_RTTI_EXPAND_ENUM, __VA_ARGS__)
++ #define X_RTTI_EXPAND_ENUM_1(_enum) X_RTTI_EXPAND_ENUM_2(_enum, _enum)
++@@ -201,7 +219,8 @@ public: \
++         { \
++             type->template AddOptions<_expansion>(); \
++         } \
++-    };
+++    }; \
+++    X_RTTI_FORCE_REGISTRAR(Red::EnumExpansion<_enum, X_RTTI_LOCATION>)
++ 
++ #define RTTI_EXPAND_FLAGS(...) X_RTTI_OVERLOAD(X_RTTI_EXPAND_FLAGS, __VA_ARGS__)
++ #define X_RTTI_EXPAND_FLAGS_1(_enum) X_RTTI_EXPAND_FLAGS_2(_enum, _enum)
++@@ -215,7 +234,8 @@ public: \
++         { \
++             type->template AddFlags<_expansion>(); \
++         } \
++-    };
+++    }; \
+++    X_RTTI_FORCE_REGISTRAR(Red::EnumExpansion<_enum, X_RTTI_LOCATION>)
++ 
++ #define RTTI_OPTION() static_assert(false, "Not Implemented")
++ 
++@@ -229,7 +249,8 @@ public: \
++         { \
++             _desc; \
++         } \
++-    };
+++    }; \
+++    X_RTTI_FORCE_REGISTRAR(Red::GlobalDefinition<X_RTTI_LOCATION>)
++ #define X_RTTI_DEFINE_GLOBALS_2(_namespace, _desc) \
++     template<> \
++     struct Red::TypeInfoBuilder<Red::GlobalDefinition<X_RTTI_LOCATION>{}> \
++@@ -240,7 +261,8 @@ public: \
++             using namespace _namespace; \
++             _desc; \
++         } \
++-    };
+++    }; \
+++    X_RTTI_FORCE_REGISTRAR(Red::GlobalDefinition<X_RTTI_LOCATION>)
++ 
++ #define RTTI_FUNCTION(...) X_RTTI_OVERLOAD(X_RTTI_FUNCTION, __VA_ARGS__)
++ #define X_RTTI_FUNCTION_1(_func) X_RTTI_FUNCTION_2(_func, X_RTTI_NAME(_func))
++@@ -260,7 +282,8 @@ public: \
++         { \
++             _handler; \
++         } \
++-    };
+++    }; \
+++    X_RTTI_FORCE_REGISTRAR(Red::GlobalDefinition<X_RTTI_LOCATION>)
++ 
++ #define RTTI_DESCRIBE(_handler) \
++     template<> \
++@@ -271,4 +294,5 @@ public: \
++         { \
++             _handler; \
++         } \
++-    };
+++    }; \
+++    X_RTTI_FORCE_REGISTRAR(Red::GlobalDefinition<X_RTTI_LOCATION>)
++diff --git a/include/Red/TypeInfo/Resolving.hpp b/include/Red/TypeInfo/Resolving.hpp
++index 1e838a9..c45e97b 100644
++--- a/include/Red/TypeInfo/Resolving.hpp
+++++ b/include/Red/TypeInfo/Resolving.hpp
++@@ -104,12 +104,19 @@ consteval auto RemoveMemberPrefix(std::string_view aName)
++     return aName;
++ }
++ 
+++// MSVC spells a full enum type name as "enum RED4ext::game::X". Clang drops the keyword ("RED4ext::game::X"), so there
+++// the prefix alone does not tell an enum from a class and the type is checked as well.
+++#if defined(__clang__)
+++constexpr auto ScopedEnumPrefix = "RED4ext::";
+++#else
++ constexpr auto ScopedEnumPrefix = "enum RED4ext::";
+++#endif
++ constexpr auto ScopedEnumPrefixLength = std::char_traits<char>::length(ScopedEnumPrefix);
++ 
+++template<typename T>
++ consteval bool IsScopedEnumName(const std::string_view& aName)
++ {
++-    return aName.starts_with(ScopedEnumPrefix);
+++    return std::is_enum_v<T> && aName.starts_with(ScopedEnumPrefix);
++ }
++ 
++ template<size_t N>
++@@ -117,7 +124,7 @@ consteval auto ExtractScopedEnumName(const char* aName)
++ {
++     std::array<char, N - ScopedEnumPrefixLength + 1> result{};
++ 
++-    for (auto i = ScopedEnumPrefixLength, j = 0ull; i < N; ++i)
+++    for (size_t i = ScopedEnumPrefixLength, j = 0; i < N; ++i)
++     {
++         if (aName[i] != ':')
++         {
++@@ -196,7 +203,7 @@ consteval auto GetTypeNameStr()
++     else
++     {
++         constexpr auto fullName = nameof::nameof_full_type<U>();
++-        constexpr auto isScopedEnum = Detail::IsScopedEnumName(fullName);
+++        constexpr auto isScopedEnum = Detail::IsScopedEnumName<U>(fullName);
++ 
++         if constexpr (isScopedEnum)
++         {
+diff --git a/packages/r/red-lib/xmake.lua b/packages/r/red-lib/xmake.lua
+index 82d9734..c0b9f8a 100644
+--- a/packages/r/red-lib/xmake.lua
++++ b/packages/r/red-lib/xmake.lua
+@@ -6,16 +6,32 @@ package("red-lib")
+ 
+     add_urls("https://github.com/psiberx/cp2077-red-lib.git")
+ 
+-    add_versions("2026.08.09", "6822105d15d1b8bd1e6aae5e57827835e585cfe8")
+-    add_versions("2026.06.10", "009d404d0ed96c7bfce8e937cc1cc97cc13b1c5f")
+-    add_versions("2026.04.13", "120c46c3c4c91c70b4c23002bf77cc6dd29832b1")
++    if is_plat("macosx") then
++        -- Same source as 2026.08.09 with the macosx patch. The suffix keeps the patched package apart from cached
++        -- unpatched ones, and it is the only version offered here so dependents resolve to it.
++        add_versions("2026.08.09-macos.2", "6822105d15d1b8bd1e6aae5e57827835e585cfe8")
++    else
++        add_versions("2026.08.09", "6822105d15d1b8bd1e6aae5e57827835e585cfe8")
++        add_versions("2026.06.10", "009d404d0ed96c7bfce8e937cc1cc97cc13b1c5f")
++        add_versions("2026.04.13", "120c46c3c4c91c70b4c23002bf77cc6dd29832b1")
++    end
+ 
+     add_deps("red4ext-sdk")
+ 
+     -- RedLib pulls in <Windows.h> through the SDK and then uses std::min/std::max.
+-    add_defines("NOMINMAX")
++    if is_plat("windows") then
++        add_defines("NOMINMAX")
++    end
+ 
+-    on_install("windows|x64", function (package)
++    -- Clang fixes for the macosx build (pending in psiberx/cp2077-red-lib): registrars are only instantiated
++    -- when something uses them, the scoped-enum type names, one `auto` pair, `const bool` on an override,
++    -- and one Handle conversion. Drop this line once the pinned commit contains them.
++    if is_plat("macosx") then
++        add_patches("2026.08.09-macos.2", path.join(os.scriptdir(), "patches", "macos-clang.patch"),
++                    "982cda66338b3d8bc4c006438124f0b8cb0af2a8ffe3fb7fec8304fe6b360052")
++    end
++
++    on_install("windows|x64", "macosx|arm64", function (package)
+         -- Upstream's CMakeLists.txt only declares an INTERFACE target, it has no install
+         -- rules at all, so the headers are copied by hand. vendor/ is a second include
+         -- root: RedLib.hpp does `#include <nameof/nameof.hpp>`.
+diff --git a/packages/r/red4ext-sdk/xmake.lua b/packages/r/red4ext-sdk/xmake.lua
+index e94f686..b09cf40 100644
+--- a/packages/r/red4ext-sdk/xmake.lua
++++ b/packages/r/red4ext-sdk/xmake.lua
+@@ -7,19 +7,29 @@ package("red4ext-sdk")
+     -- checkout, which fails the clone outright on a stock Windows box.
+     set_policy("platform.longpaths", true)
+ 
+-    -- Set this to your own repo when making some PR.
+-    add_urls("https://github.com/WopsS/RED4ext.SDK.git")
++    if is_plat("macosx") then
++        -- macOS (Apple Silicon): jackmaxwil's port of the SDK, based on RED4ext.SDK 1.0. Same include/ layout.
++        -- Game addresses resolve through its cyberpunk2077_addresses.json at run time, not through this package.
++        add_urls("https://github.com/jackmaxwil/RED4ext.SDK-macos.git")
+ 
+-    add_versions("2026.07.30", "ad7277714ad30d6885d7050c5ba24fa0102f6920")
+-    add_versions("2026.07.06", "cce6e255f5e61056e634f324a3dbdfa6da523af9")
+-    add_versions("2026.06.07", "109b585a956b694b859ca9e75766543be60d2051")
+-    add_versions("2026.05.30", "fcda519942ef74d2191accfa752bb5c423f3e953")
+-    add_versions("2026.03.09", "a4a781088a92a8efa890d94fde4efd8985d497c7")
++        add_versions("2026.10.11", "f657158c0c11248932c4a8567d800286d5e29e62")
++    else
++        -- Set this to your own repo when making some PR.
++        add_urls("https://github.com/WopsS/RED4ext.SDK.git")
++
++        add_versions("2026.07.30", "ad7277714ad30d6885d7050c5ba24fa0102f6920")
++        add_versions("2026.07.06", "cce6e255f5e61056e634f324a3dbdfa6da523af9")
++        add_versions("2026.06.07", "109b585a956b694b859ca9e75766543be60d2051")
++        add_versions("2026.05.30", "fcda519942ef74d2191accfa752bb5c423f3e953")
++        add_versions("2026.03.09", "a4a781088a92a8efa890d94fde4efd8985d497c7")
++    end
+ 
+     -- Relocation-inl.hpp pops a MessageBoxW when an address lookup fails, so anything
+     -- touching RED4ext::UniversalReloc* needs User32 -- including header-only consumers,
+     -- which is most of them.
+-    add_syslinks("User32")
++    if is_plat("windows") then
++        add_syslinks("User32")
++    end
+ 
+     -- The SDK is consumed header-only by most of the CP2077 modding ecosystem
+     -- (TweakXL, ArchiveXL, Codeware, SharedPunk, ...), so that is the default here too.
+@@ -37,7 +47,7 @@ package("red4ext-sdk")
+         end
+     end)
+ 
+-    on_install("windows|x64", function (package)
++    on_install("windows|x64", "macosx|arm64", function (package)
+         if not package:config("headeronly") then
+             local configs = {"-DRED4EXT_HEADER_ONLY=OFF", "-DRED4EXT_BUILD_EXAMPLES=OFF", "-DRED4EXT_USE_PCH=OFF"}
+             table.insert(configs, "-DCMAKE_BUILD_TYPE=" .. (package:is_debug() and "Debug" or "Release"))
+@@ -50,7 +60,9 @@ package("red4ext-sdk")
+ 
+         -- RED4ext/GpuApi/*.hpp do `#include <D3D12MemAlloc.h>`, and upstream's install
+         -- rules only cover include/ -- without this, anything reaching GpuApi fails to compile.
+-        os.cp("vendor/D3D12MemAlloc/D3D12MemAlloc.h", package:installdir("include"))
++        if package:is_plat("windows") then
++            os.cp("vendor/D3D12MemAlloc/D3D12MemAlloc.h", package:installdir("include"))
++        end
+     end)
+ 
+     on_test("windows|x64", function (package)
+diff --git a/packages/s/sharedpunk/xmake.lua b/packages/s/sharedpunk/xmake.lua
+index 1deb6ab..aa5c330 100644
+--- a/packages/s/sharedpunk/xmake.lua
++++ b/packages/s/sharedpunk/xmake.lua
+@@ -3,25 +3,39 @@ package("sharedpunk")
+     set_description("Core utilities and reverse engineered game data for Cyberpunk 2077 mods built on RED4ext.SDK and RedLib.")
+     set_license("MIT")
+ 
+-    -- xmake walks these in order and only gives up after the last one, so the GitLab
+-    -- mirror covers the GitHub repository being unreachable.
+-    add_urls("https://gitlab.com/alphanin9/sharedpunk.git",
+-             "https://github.com/alphanin9/SharedPunk.git")
++    if is_plat("macosx") then
++        -- TEMPORARY: the macOS support is not in alphanin9/SharedPunk yet (src/code/Mac, the Apple branches of
++        -- the hook driver, Save.cpp and Core.hpp, and the macosx branch of its xmake.lua). Replace with an
++        -- upstream commit once that is merged.
++        add_urls("https://github.com/codeman101/SharedPunk.git")
+ 
+-    add_versions("2026.08.19", "3d739ea6bf2babe8bba085c2142f62c432593ad0")
++        add_versions("2026.08.19-macos.2", "1b0bdea18353e4451051d4d3a45ac84066efa7be")
++    else
++        -- xmake walks these in order and only gives up after the last one, so the GitLab
++        -- mirror covers the GitHub repository being unreachable.
++        add_urls("https://gitlab.com/alphanin9/sharedpunk.git",
++                 "https://github.com/alphanin9/SharedPunk.git")
++
++        add_versions("2026.08.19", "3d739ea6bf2babe8bba085c2142f62c432593ad0")
++    end
+ 
+     -- SharedPunk's own xmake.lua requires these three and adds this repository to find
+-    -- them, so they resolve to the same packages installed here.
+-    add_deps("red4ext-sdk", "red-lib", "safetyhook")
++    -- them, so they resolve to the same packages installed here. safetyhook is x86 only: the
++    -- macOS hook driver goes through the RED4ext loader API instead.
++    add_deps("red4ext-sdk", "red-lib")
++    if is_plat("windows") then
++        add_deps("safetyhook")
++    end
+ 
+     -- Mirrors the target's add_defines. WIN32_LEAN_AND_MEAN in particular has to match
+     -- across the boundary: it changes what <Windows.h> declares, and the public headers
+     -- are compiled again in the consumer.
+-    add_defines("WINVER=0x0601", "WIN32_LEAN_AND_MEAN", "NOMINMAX")
+-
+-    add_syslinks("Version", "User32")
++    if is_plat("windows") then
++        add_defines("WINVER=0x0601", "WIN32_LEAN_AND_MEAN", "NOMINMAX")
++        add_syslinks("Version", "User32")
++    end
+ 
+-    on_install("windows|x64", function (package)
++    on_install("windows|x64", "macosx|arm64", function (package)
+         import("package.tools.xmake").install(package)
+     end)
+ 
+diff --git a/packages/t/tweak-xl/patches/macos-support-header.patch b/packages/t/tweak-xl/patches/macos-support-header.patch
+new file mode 100644
+index 0000000..daf9bb5
+--- /dev/null
++++ b/packages/t/tweak-xl/patches/macos-support-header.patch
+@@ -0,0 +1,79 @@
++diff --git a/support/red4ext/TweakXL.hpp b/support/red4ext/TweakXL.hpp
++index f413f39..8c75992 100644
++--- a/support/red4ext/TweakXL.hpp
+++++ b/support/red4ext/TweakXL.hpp
++@@ -3,8 +3,12 @@
++ #include <filesystem>
++ #include <vector>
++ 
+++#if defined(_WIN32)
++ #include <libloaderapi.h>
++ #include <minwindef.h>
+++#else
+++#include <dlfcn.h>
+++#endif
++ 
++ #include <RED4ext/Callback.hpp>
++ #include <RED4ext/Memory/Allocators.hpp>
++@@ -60,13 +64,38 @@ public:
++ private:
++     TweakXL() = default;
++ 
+++#if !defined(_WIN32)
+++    // Same test as the Windows branch above: the PoolEngine pool is in the vault's pool registry. Vault::Get() cannot
+++    // be used here, so the vault is taken from the game's PoolStorageProxy<PoolEngine>::GetAllocator(). That storage
+++    // is set up when the game image loads and its allocator is the DefaultAllocator, the first member of the vault.
+++    // The getter only reads that static and allocates nothing, so it is safe at any time.
+++    inline static bool IsPoolEngineRegistered()
+++    {
+++        using GetVault_t = RED4ext::Memory::Vault* (*)();
+++
+++        static const auto getVault = reinterpret_cast<GetVault_t>(
+++            dlsym(RTLD_MAIN_ONLY, "_ZN3red6memory16PoolStorageProxyINS_10PoolEngineEE12GetAllocatorEv"));
+++
+++        if (!getVault)
+++            return false;
+++
+++        auto vault = getVault();
+++        return vault && vault->poolRegistry.Get(RED4ext::Memory::PoolEngine::Name);
+++    }
+++
+++#endif
++     inline static bool Initialize()
++     {
++         if (s_facade)
++             return true;
++ 
+++#if defined(_WIN32)
++         if (!RED4ext::Memory::Vault::Get()->poolRegistry.Get(RED4ext::Memory::PoolEngine::Name))
++             return false;
+++#else
+++        if (!IsPoolEngineRegistered())
+++            return false;
+++#endif
++ 
++         auto facade = RED4ext::CRTTISystem::Get()->GetClass("TweakXL");
++ 
++@@ -131,10 +160,22 @@ private:
++ 
++     inline static std::filesystem::path GetModulePath(HMODULE aHandle)
++     {
+++#if defined(_WIN32)
++         wchar_t path[MAX_PATH]{0};
++         auto length = GetModuleFileNameW(aHandle, path, MAX_PATH);
++ 
++         return std::filesystem::path(path).parent_path();
+++#else
+++        // The plugin that includes this header: find the image that holds this function.
+++        (void)aHandle;
+++        Dl_info info{};
+++        if (dladdr(reinterpret_cast<const void*>(&GetModulePath), &info) && info.dli_fname)
+++        {
+++            return std::filesystem::path(info.dli_fname).parent_path();
+++        }
+++
+++        return {};
+++#endif
++     }
++ 
++     inline static RED4ext::CClass* s_facade;
+diff --git a/packages/t/tweak-xl/xmake.lua b/packages/t/tweak-xl/xmake.lua
+index 0a7ef3c..031b208 100644
+--- a/packages/t/tweak-xl/xmake.lua
++++ b/packages/t/tweak-xl/xmake.lua
+@@ -7,15 +7,28 @@ package("tweak-xl")
+     -- This packages support/red4ext/ only. It does not build the TweakXL mod itself --
+     -- users still need TweakXL installed in their game for the registration calls to do anything.
+     add_urls("https://github.com/psiberx/cp2077-tweak-xl/archive/refs/tags/$(version).tar.gz",
+-             "https://github.com/psiberx/cp2077-tweak-xl.git")
++             "https://github.com/psiberx/cp2077-tweak-xl.git",
++             {version = function (version) return (tostring(version):gsub("%-macos%.%d+$", "")) end})
+ 
+-    add_versions("v1.11.4", "38b414622d68022620910bb56656afe183933e9dff987b1090e7007e5b526a88")
+-    add_versions("v1.11.3", "2cdf7e999ec3e99c071b06204c37edf62d53d7060499ad3d32cc3e6dad328b60")
+-    add_versions("v1.11.2", "10e8682a3e36b6774e2a66ac3760c2e2b74b6122b5dfe098c88a859ccc2c56a6")
++    if is_plat("macosx") then
++        -- Same source as v1.11.4 with the macosx patch. The suffix keeps the patched package apart from cached
++        -- unpatched ones, and it is the only version offered here so dependents resolve to it.
++        add_versions("v1.11.4-macos.2", "38b414622d68022620910bb56656afe183933e9dff987b1090e7007e5b526a88")
++    else
++        add_versions("v1.11.4", "38b414622d68022620910bb56656afe183933e9dff987b1090e7007e5b526a88")
++        add_versions("v1.11.3", "2cdf7e999ec3e99c071b06204c37edf62d53d7060499ad3d32cc3e6dad328b60")
++        add_versions("v1.11.2", "10e8682a3e36b6774e2a66ac3760c2e2b74b6122b5dfe098c88a859ccc2c56a6")
++    end
+ 
+     add_deps("red4ext-sdk")
+ 
+-    on_install("windows|x64", function (package)
++    -- Same header change as archive-xl, for TweakXL.hpp. Pending in psiberx/cp2077-tweak-xl.
++    if is_plat("macosx") then
++        add_patches("v1.11.4-macos.2", path.join(os.scriptdir(), "patches", "macos-support-header.patch"),
++                    "e06e0722d26592b52c0d0008994518cffeb9a46e4210f9840d93a876f35dfc3c")
++    end
++
++    on_install("windows|x64", "macosx|arm64", function (package)
+         -- The header as shipped is not self-contained: it starts with <libloaderapi.h> /
+         -- <minwindef.h> (which need <Windows.h> first for _AMD64_, else winnt.h errors with
+         -- "No Target Architecture") and then pulls <RED4ext/RTTISystem.hpp>, which on its own
+@@ -23,10 +36,17 @@ package("tweak-xl")
+         -- gets away with it because every consumer includes the SDK umbrella header from a
+         -- pch first. Hoisting that umbrella here fixes both, and costs nothing: RTTISystem.hpp
+         -- already drags in most of the SDK anyway.
+-        io.replace("support/red4ext/TweakXL.hpp",
+-                   "#include <libloaderapi.h>",
+-                   "#include <RED4ext/RED4ext.hpp>\n\n#include <libloaderapi.h>",
+-                   {plain = true})
++        if package:is_plat("windows") then
++            io.replace("support/red4ext/TweakXL.hpp",
++                       "#include <libloaderapi.h>",
++                       "#include <RED4ext/RED4ext.hpp>\n\n#include <libloaderapi.h>",
++                       {plain = true})
++        else
++            io.replace("support/red4ext/TweakXL.hpp",
++                       "#include <filesystem>",
++                       "#include <RED4ext/RED4ext.hpp>\n\n#include <filesystem>",
++                       {plain = true})
++        end
+ 
+         os.cp("support/red4ext/TweakXL.hpp", package:installdir("include/RED4ext"))
+     end)
