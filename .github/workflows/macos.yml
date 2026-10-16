@@ -36,6 +36,15 @@ jobs:
     - name: Update XMake repo
       run: xmake repo --update
 
+    # CI branch only (not in the PR): until cp2077-xmake-repo has the macosx recipes, build against a
+    # copy of it with the patch from the PR comment applied.
+    - name: Patched cp2077-xmake-repo
+      run: |
+        git clone --depth 50 https://gitlab.com/alphanin9/cp2077-xmake-repo.git "$RUNNER_TEMP/xr"
+        git -C "$RUNNER_TEMP/xr" apply "$GITHUB_WORKSPACE/.github/ci/cp2077-xmake-repo-macosx.patch"
+        sed -i '' "s#https://gitlab.com/alphanin9/cp2077-xmake-repo.git#$RUNNER_TEMP/xr#" xmake.lua
+        grep -n add_repositories xmake.lua
+
     - name: Configure XMake and install dependencies
       run: xmake f -p macosx -a arm64 -m release -y -v
 
