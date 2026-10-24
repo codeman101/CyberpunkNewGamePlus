@@ -394,7 +394,7 @@ inline RawBuffer MakeScriptForwardCode(CBaseFunction* aFunc)
     constexpr uint32_t BaseCodeSize = OpSize + OffsetSize * 2 + PointerSize + FlagsSize + OpSize;
     constexpr uint16_t BaseExitOffset = BaseCodeSize - OpSize - OffsetSize;
 
-    const uint32_t extraCodeSize = aFunc->params.size * (OpSize + PointerSize) + (aFunc->returnType ? 1 : 0);
+    const uint32_t extraCodeSize = aFunc->params.Size() * (OpSize + PointerSize) + (aFunc->returnType ? 1 : 0);
     const uint32_t finalCodeSize = BaseCodeSize + extraCodeSize;
     const uint16_t finalExitOffset = BaseExitOffset + extraCodeSize;
 
@@ -597,7 +597,7 @@ public:
 
         auto bytecode = Detail::MakeScriptForwardCode(nativeFunc);
         scriptFunc->bytecode.bytecode.buffer.data = bytecode.data;
-        scriptFunc->bytecode.bytecode.buffer.size = bytecode.size;
+        scriptFunc->bytecode.bytecode.buffer.size = bytecode.Size();
 
         scriptFunc->flags.isNative = false;
 
@@ -647,7 +647,7 @@ public:
 template<typename TClass>
 class ClassDescriptorDefaultImpl : public ClassDescriptor<TClass>
 {
-    const bool IsEqual(const ScriptInstance aLhs, const ScriptInstance aRhs, uint32_t a3) final // 48
+    const bool IsEqual(const void* aLhs, const void* aRhs, uint32_t a3) final // 48
     {
         if constexpr (Detail::IsConstructionForwarded<TClass>)
         {
@@ -659,13 +659,13 @@ class ClassDescriptorDefaultImpl : public ClassDescriptor<TClass>
         }
         else
         {
-            using func_t = bool (*)(CClass*, const ScriptInstance, const ScriptInstance, uint32_t);
+            using func_t = bool (*)(CClass*, const void*, const void*, uint32_t);
             UniversalRelocFunc<func_t> func(Detail::AddressHashes::TTypedClass_IsEqual);
             return func(this, aLhs, aRhs, a3);
         }
     }
 
-    void Assign(ScriptInstance aLhs, const ScriptInstance aRhs) const final // 50
+    void Assign(void* aLhs, const void* aRhs) const final // 50
     {
         if constexpr (Detail::IsConstructionForwarded<TClass>)
         {
@@ -676,7 +676,7 @@ class ClassDescriptorDefaultImpl : public ClassDescriptor<TClass>
         }
         else if constexpr (std::is_copy_constructible_v<TClass>)
         {
-            new (aLhs) TClass(*static_cast<TClass*>(aRhs));
+            new (aLhs) TClass(*static_cast<const TClass*>(aRhs));
         }
     }
 
@@ -696,7 +696,7 @@ class ClassDescriptorDefaultImpl : public ClassDescriptor<TClass>
         }
     }
 
-    void ConstructCls(ScriptInstance aMemory) const final // D8
+    void ConstructCls(void* aMemory) const final // D8
     {
         if constexpr (Detail::IsConstructionForwarded<TClass>)
         {
@@ -711,7 +711,7 @@ class ClassDescriptorDefaultImpl : public ClassDescriptor<TClass>
         }
     }
 
-    void DestructCls(ScriptInstance aMemory) const final // E0
+    void DestructCls(void* aMemory) const final // E0
     {
         if constexpr (Detail::IsConstructionForwarded<TClass>)
         {
@@ -760,9 +760,9 @@ public:
         if (aValue > Limits::max())
             return;
 
-        for (uint32_t i = 0; i != valueList.size; ++i)
+        for (uint32_t i = 0; i != valueList.Size(); ++i)
         {
-            if (aValue == valueList.entries[i])
+            if (aValue == valueList[i])
                 return;
         }
 
